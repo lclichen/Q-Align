@@ -17,7 +17,11 @@ dir_path = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, dir_path)
 
 import transformers
+from transformers.modeling_outputs import *
 from transformers.models.llama.modeling_llama import *
+from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+# ref to https://github.com/Q-Future/Q-Align/issues/31
+from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa, _prepare_4d_causal_attention_mask_for_sdpa
 
 def _get_unpad_data(attention_mask):
     seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
@@ -35,7 +39,9 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
 from .modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
+from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask_for_sdpa
 from .configuration_mplug_owl2 import LlamaConfig
+logger = logging.get_logger(__name__)
 
 class MultiwayNetwork(nn.Module):
 
@@ -157,7 +163,10 @@ class LlamaAttention(nn.Module):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        # ref to https://github.com/Q-Future/Q-Align/issues/38
+        # cos, sin = self.rotary_emb(value_states, torch.arange(0, kv_seq_len).reshape(1, -1).to(value_states.device))
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
@@ -228,7 +237,7 @@ class LlamaFlashAttention2(LlamaAttention):
         modality_indicators: torch.Tensor,
         attention_mask: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_value = None, # : Optional[Cache]
         output_attentions: bool = False,
         use_cache: bool = False,
         **kwargs,
@@ -260,7 +269,10 @@ class LlamaFlashAttention2(LlamaAttention):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        # ref to https://github.com/Q-Future/Q-Align/issues/38
+        # cos, sin = self.rotary_emb(value_states, torch.arange(0, kv_seq_len).reshape(1, -1).to(value_states.device))
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
         if past_key_value is not None:
@@ -425,7 +437,7 @@ class LlamaSdpaAttention(LlamaAttention):
         modality_indicators: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_value = None, # : Optional[Cache]
         output_attentions: bool = False,
         use_cache: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
@@ -458,7 +470,10 @@ class LlamaSdpaAttention(LlamaAttention):
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        cos, sin = self.rotary_emb(value_states, position_ids)
+        # ref to https://github.com/Q-Future/Q-Align/issues/38
+        # cos, sin = self.rotary_emb(value_states, torch.arange(0, kv_seq_len).reshape(1, -1).to(value_states.device))
 
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
 
@@ -598,6 +613,9 @@ def model_forward(
     use_cache = use_cache if use_cache is not None else self.config.use_cache
 
     return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    self._use_sdpa = self.config._attn_implementation == "sdpa"
+    self._use_flash_attention_2 = self.config._attn_implementation == "flash_attention_2"
 
     # retrieve input_ids and inputs_embeds
     if input_ids is not None and inputs_embeds is not None:
